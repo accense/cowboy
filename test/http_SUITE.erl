@@ -1,4 +1,4 @@
-%% Copyright (c) 2011, Loïc Hoguin <essen@dev-extend.eu>
+%% Copyright (c) 2011-2012, Loïc Hoguin <essen@ninenines.eu>
 %% Copyright (c) 2011, Anthony Ramine <nox@dev-extend.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
@@ -45,6 +45,7 @@
 -export([nc_zero/1]).
 -export([onrequest/1]).
 -export([onrequest_reply/1]).
+-export([onresponse_crash/1]).
 -export([onresponse_reply/1]).
 -export([pipeline/1]).
 -export([rest_keepalive/1]).
@@ -58,6 +59,8 @@
 -export([static_attribute_etag/1]).
 -export([static_function_etag/1]).
 -export([static_mimetypes_function/1]).
+-export([static_specify_file/1]).
+-export([static_specify_file_catchall/1]).
 -export([static_test_file/1]).
 -export([static_test_file_css/1]).
 -export([stream_body_set_resp/1]).
@@ -101,6 +104,8 @@ groups() ->
 		static_attribute_etag,
 		static_function_etag,
 		static_mimetypes_function,
+		static_specify_file,
+		static_specify_file_catchall,
 		static_test_file,
 		static_test_file_css,
 		stream_body_set_resp,
@@ -116,6 +121,7 @@ groups() ->
 			onrequest_reply
 		]},
 		{onresponse, [], [
+			onresponse_crash,
 			onresponse_reply
 		]}
 	].
@@ -134,7 +140,7 @@ init_per_group(http, Config) ->
 	Port = 33080,
 	Transport = cowboy_tcp_transport,
 	Config1 = init_static_dir(Config),
-	cowboy:start_listener(http, 100,
+	{ok, _} = cowboy:start_listener(http, 100,
 		Transport, [{port, Port}],
 		cowboy_http_protocol, [
 			{dispatch, init_dispatch(Config1)},
@@ -156,7 +162,7 @@ init_per_group(https, Config) ->
 	application:start(crypto),
 	application:start(public_key),
 	application:start(ssl),
-	{ok,_} = cowboy:start_listener(https, 100,
+	{ok, _} = cowboy:start_listener(https, 100,
 		Transport, Opts ++ [{port, Port}],
 		cowboy_http_protocol, [
 			{dispatch, init_dispatch(Config1)},
@@ -241,6 +247,10 @@ init_dispatch(Config) ->
 			{[<<"static_function_etag">>, '...'], cowboy_http_static,
 				[{directory, ?config(static_dir, Config)},
 				 {etag, {fun static_function_etag/2, etag_data}}]},
+			{[<<"static_specify_file">>, '...'],  cowboy_http_static,
+				[{directory, ?config(static_dir, Config)},
+				 {mimetypes, [{<<".css">>, [<<"text/css">>]}]},
+				 {file, <<"test_file.css">>}]},
 			{[<<"multipart">>], http_handler_multipart, []},
 			{[<<"echo">>, <<"body">>], http_handler_echo_body, []},
 			{[<<"simple">>], rest_simple_resource, []},
@@ -348,7 +358,7 @@ The document has moved
 		{400, "\n"},
 		{400, "Garbage\r\n\r\n"},
 		{400, "\r\n\r\n\r\n\r\n\r\n\r\n"},
-		{400, "GET / HTTP/1.1\r\nHost: dev-extend.eu\r\n\r\n"},
+		{400, "GET / HTTP/1.1\r\nHost: ninenines.eu\r\n\r\n"},
 		{400, "GET http://proxy/ HTTP/1.1\r\n\r\n"},
 		{400, ResponsePacket},
 		{408, "GET / HTTP/1.1\r\n"},
@@ -604,6 +614,13 @@ onrequest_hook(Req) ->
 			Req3
 	end.
 
+onresponse_crash(Config) ->
+	Client = ?config(client, Config),
+	{ok, Client2} = cowboy_client:request(<<"GET">>,
+		build_url("/handler_errors?case=init_before_reply", Config), Client),
+	{ok, 777, Headers, _} = cowboy_client:response(Client2),
+	{<<"x-hook">>, <<"onresponse">>} = lists:keyfind(<<"x-hook">>, 1, Headers).
+
 onresponse_reply(Config) ->
 	Client = ?config(client, Config),
 	{ok, Client2} = cowboy_client:request(<<"GET">>,
@@ -795,6 +812,24 @@ static_mimetypes_function(Config) ->
 	{ok, 200, Headers, _} = cowboy_client:response(Client2),
 	{<<"content-type">>, <<"text/html">>}
 		= lists:keyfind(<<"content-type">>, 1, Headers).
+
+static_specify_file(Config) ->
+	Client = ?config(client, Config),
+	{ok, Client2} = cowboy_client:request(<<"GET">>,
+		build_url("/static_specify_file", Config), Client),
+	{ok, 200, Headers, Client3} = cowboy_client:response(Client2),
+	{<<"content-type">>, <<"text/css">>}
+		= lists:keyfind(<<"content-type">>, 1, Headers),
+	{ok, <<"test_file.css\n">>, _} = cowboy_client:response_body(Client3).
+
+static_specify_file_catchall(Config) ->
+	Client = ?config(client, Config),
+	{ok, Client2} = cowboy_client:request(<<"GET">>,
+		build_url("/static_specify_file/none", Config), Client),
+	{ok, 200, Headers, Client3} = cowboy_client:response(Client2),
+	{<<"content-type">>, <<"text/css">>}
+		= lists:keyfind(<<"content-type">>, 1, Headers),
+	{ok, <<"test_file.css\n">>, _} = cowboy_client:response_body(Client3).
 
 static_test_file(Config) ->
 	Client = ?config(client, Config),
