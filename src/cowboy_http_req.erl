@@ -1,4 +1,4 @@
-%% Copyright (c) 2011, Loïc Hoguin <essen@dev-extend.eu>
+%% Copyright (c) 2011-2012, Loïc Hoguin <essen@ninenines.eu>
 %% Copyright (c) 2011, Anthony Ramine <nox@dev-extend.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
@@ -222,7 +222,8 @@ headers(Req) ->
 %% returned is used as a return value.
 %% @see parse_header/3
 -spec parse_header(cowboy_http:header(), #http_req{})
-	-> {any(), #http_req{}} | {error, badarg}.
+	-> {any(), #http_req{}} | {undefined, binary(), #http_req{}}
+	| {error, badarg}.
 parse_header(Name, Req=#http_req{p_headers=PHeaders}) ->
 	case lists:keyfind(Name, 1, PHeaders) of
 		false -> parse_header(Name, Req, parse_header_default(Name));
@@ -239,7 +240,8 @@ parse_header_default(_Name) -> undefined.
 %%
 %% When the header is unknown, the value is returned directly without parsing.
 -spec parse_header(cowboy_http:header(), #http_req{}, any())
-	-> {any(), #http_req{}} | {error, badarg}.
+	-> {any(), #http_req{}} | {undefined, binary(), #http_req{}}
+	| {error, badarg}.
 parse_header(Name, Req, Default) when Name =:= 'Accept' ->
 	parse_header(Name, Req, Default,
 		fun (Value) ->
@@ -275,7 +277,7 @@ parse_header(Name, Req, Default) when Name =:= 'Content-Type' ->
 		fun (Value) ->
 			cowboy_http:content_type(Value)
 		end);
-parse_header(Name, Req, Default) when Name =:= 'Expect' ->
+parse_header(Name, Req, Default) when Name =:= <<"Expect">> ->
 	parse_header(Name, Req, Default,
 		fun (Value) ->
 			cowboy_http:nonempty_list(Value, fun cowboy_http:expectation/2)
@@ -307,8 +309,15 @@ parse_header(Name, Req, Default) ->
 	{Value, Req2} = header(Name, Req, Default),
 	{undefined, Value, Req2}.
 
-%% @todo This doesn't look in the cache.
 parse_header(Name, Req=#http_req{p_headers=PHeaders}, Default, Fun) ->
+	case lists:keyfind(Name, 1, PHeaders) of
+		{Name, P} ->
+			{P, Req};
+		false ->
+			parse_header_no_cache(Name, Req, Default, Fun)
+	end.
+
+parse_header_no_cache(Name, Req=#http_req{p_headers=PHeaders}, Default, Fun) ->
 	case header(Name, Req) of
 		{undefined, Req2} ->
 			{Default, Req2#http_req{p_headers=[{Name, Default}|PHeaders]}};
@@ -429,8 +438,19 @@ init_stream(TransferDecode, TransferState, ContentDecode, Req) ->
 %% for each streamed part, and {done, Req} when it's finished streaming.
 -spec stream_body(#http_req{}) -> {ok, binary(), #http_req{}}
 	| {done, #http_req{}} | {error, atom()}.
-stream_body(Req=#http_req{body_state=waiting}) ->
-	case parse_header('Transfer-Encoding', Req) of
+stream_body(Req=#http_req{body_state=waiting,
+		version=Version, transport=Transport, socket=Socket}) ->
+	case parse_header(<<"Expect">>, Req) of
+		{[<<"100-continue">>], Req1} ->
+			HTTPVer = cowboy_http:version_to_binary(Version),
+			Transport:send(Socket,
+				<< HTTPVer/binary, " ", (status(100))/binary, "\r\n\r\n" >>);
+		{undefined, Req1} ->
+			ok;
+		{undefined, _, Req1} ->
+			ok
+	end,
+	case parse_header('Transfer-Encoding', Req1) of
 		{[<<"chunked">>], Req2} ->
 			stream_body(Req2#http_req{body_state=
 				{stream, fun cowboy_http:te_chunked/2, {0, 0},
@@ -452,7 +472,13 @@ stream_body(Req=#http_req{buffer=Buffer, body_state={stream, _, _, _}})
 stream_body(Req=#http_req{body_state={stream, _, _, _}}) ->
 	stream_body_recv(Req);
 stream_body(Req=#http_req{body_state=done}) ->
-	{done, Req}.
+	{done, Req};
+stream_body(Req=#http_req{body_state={multipart, _N, _Fun},
+		transport=Transport, socket=Socket}) ->
+	case Transport:recv(Socket, 0, 5000) of
+		{ok, Data} -> {ok, Data, Req};
+		{error, Reason} -> {error, Reason}
+	end.
 
 -spec stream_body_recv(#http_req{})
 	-> {ok, binary(), #http_req{}} | {error, atom()}.
@@ -576,20 +602,12 @@ multipart_data(Req=#http_req{body_state=waiting}) ->
 	{{<<"multipart">>, _SubType, Params}, Req2} =
 		parse_header('Content-Type', Req),
 	{_, Boundary} = lists:keyfind(<<"boundary">>, 1, Params),
-	{Length, Req3=#http_req{buffer=Buffer}} =
-		parse_header('Content-Length', Req2),
-	multipart_data(Req3, Length, cowboy_multipart:parser(Boundary), Buffer);
+	{Length, Req3} = parse_header('Content-Length', Req2),
+	multipart_data(Req3, Length, {more, cowboy_multipart:parser(Boundary)});
 multipart_data(Req=#http_req{body_state={multipart, Length, Cont}}) ->
 	multipart_data(Req, Length, Cont());
 multipart_data(Req=#http_req{body_state=done}) ->
 	{eof, Req}.
-
-multipart_data(Req, Length, Parser, Buffer) when byte_size(Buffer) >= Length ->
-	<< Data:Length/binary, Rest/binary >> = Buffer,
-	multipart_data(Req#http_req{buffer=Rest}, 0, Parser(Data));
-multipart_data(Req, Length, Parser, Buffer) ->
-	NewLength = Length - byte_size(Buffer),
-	multipart_data(Req#http_req{buffer= <<>>}, NewLength, Parser(Buffer)).
 
 multipart_data(Req, Length, {headers, Headers, Cont}) ->
 	{{headers, Headers}, Req#http_req{body_state={multipart, Length, Cont}}};
@@ -601,15 +619,15 @@ multipart_data(Req, 0, eof) ->
 	{eof, Req#http_req{body_state=done}};
 multipart_data(Req=#http_req{socket=Socket, transport=Transport},
 		Length, eof) ->
+	%% We just want to skip so no need to stream data here.
 	{ok, _Data} = Transport:recv(Socket, Length, 5000),
 	{eof, Req#http_req{body_state=done}};
-multipart_data(Req=#http_req{socket=Socket, transport=Transport},
-		Length, {more, Parser}) when Length > 0 ->
-	case Transport:recv(Socket, 0, 5000) of
-		{ok, << Data:Length/binary, Buffer/binary >>} ->
-			multipart_data(Req#http_req{buffer=Buffer}, 0, Parser(Data));
-		{ok, Data} ->
-			multipart_data(Req, Length - byte_size(Data), Parser(Data))
+multipart_data(Req, Length, {more, Parser}) when Length > 0 ->
+	case stream_body(Req) of
+		{ok, << Data:Length/binary, Buffer/binary >>, Req2} ->
+			multipart_data(Req2#http_req{buffer=Buffer}, 0, Parser(Data));
+		{ok, Data, Req2} ->
+			multipart_data(Req2, Length - byte_size(Data), Parser(Data))
 	end.
 
 %% @doc Skip a part returned by the multipart parser.
@@ -918,6 +936,9 @@ status(423) -> <<"423 Locked">>;
 status(424) -> <<"424 Failed Dependency">>;
 status(425) -> <<"425 Unordered Collection">>;
 status(426) -> <<"426 Upgrade Required">>;
+status(428) -> <<"428 Precondition Required">>;
+status(429) -> <<"429 Too Many Requests">>;
+status(431) -> <<"431 Request Header Fields Too Large">>;
 status(500) -> <<"500 Internal Server Error">>;
 status(501) -> <<"501 Not Implemented">>;
 status(502) -> <<"502 Bad Gateway">>;
@@ -927,6 +948,7 @@ status(505) -> <<"505 HTTP Version Not Supported">>;
 status(506) -> <<"506 Variant Also Negotiates">>;
 status(507) -> <<"507 Insufficient Storage">>;
 status(510) -> <<"510 Not Extended">>;
+status(511) -> <<"511 Network Authentication Required">>;
 status(B) when is_binary(B) -> B.
 
 -spec header_to_binary(cowboy_http:header()) -> binary().
